@@ -1,0 +1,210 @@
+<?php
+/**
+ * @file
+ * Implements 123PAY payment services for use in Drupal Commerce.
+ * @author
+ * 123Pay Developments <developments@123pay.ir>
+ * @license
+ * GPLv2
+ **/
+function commerce_Ir123pay_commerce_payment_method_info() {
+	$payment_methods             = array();
+	$payment_methods['Ir123pay'] = array(
+		'base'                 => 'commerce_ir123pay',
+		'title'                => t( '123PAY' ),
+		'short_title'          => t( '123PAY' ),
+		'display_title'        => t( '123PAY' ),
+		'description'          => t( 'Integrates 123PAY payment system' ),
+		'terminal'             => true,
+		'offsite'              => true,
+		'offsite_autoredirect' => true
+	);
+
+	return $payment_methods;
+}
+
+
+function commerce_Ir123pay_settings_form( $settings = null ) {
+	$form                = array();
+	$settings            = (array) $settings + array(
+			'merchant_id' => '',
+			'currency'    => variable_get( 'commerce_default_currency', 'IRR' )
+		);
+	$form['merchant_id'] = array(
+		'#type'          => 'textfield',
+		'#title'         => t( 'merchant id' ),
+		'#description'   => t( '123pay merchant id' ),
+		'#default_value' => isset( $settings['merchant_id'] ) ? $settings['merchant_id'] : ""
+	);
+	$form['currency']    = array(
+		'#type'          => 'select',
+		'#title'         => t( 'Currency code' ),
+		'#description'   => t( 'Transactions can only be processed in one of the listed currencies.' ),
+		'#options'       => commerce_Ir123pay_currencies(),
+		'#default_value' => $settings['currency']
+	);
+	$form['#submit'][]   = 'commerce_Ir123pay_settings_form_submit';
+
+	return $form;
+}
+
+
+function commerce_Ir123pay_redirect_form( $form, &$form_state, $order, $payment_method ) {
+
+	if ( empty( $payment_method['settings']['merchant_id'] ) ) {
+		drupal_set_message( t( '123pay is not configured for use. No 123pay merchant ID has been specified.' ), 'error' );
+
+		return array();
+	}
+
+	$settings = array(
+		'cancel_return'  => url( 'checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array(
+			'absolute' => true
+		) ),
+		'return'         => url( 'checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array(
+			'absolute' => true
+		) ),
+		'payment_method' => $payment_method['instance_id']
+	);
+
+	return commerce_Ir123pay_build_redirect_form( $form, $form_state, $order, $payment_method['settings'] + $settings );
+}
+
+
+function commerce_Ir123pay_build_redirect_form( $form, &$form_state, $order, $settings ) {
+	global $user;
+	$wrapper       = entity_metadata_wrapper( 'commerce_order', $order );
+	$currency_code = $wrapper->commerce_order_total->currency_code->value();
+	$amount        = (int) $wrapper->commerce_order_total->amount->value();
+
+	$merchant_id  = $settings['merchant_id'];
+	$amount       = ( strtolower( $currency_code ) == 'irr' ) ? $amount : $amount * 10;
+	$callback_url = $settings['return'];
+
+	$ch = curl_init();
+	curl_setopt( $ch, CURLOPT_URL, 'https://123pay.ir/api/v1/create/payment' );
+	curl_setopt( $ch, CURLOPT_POSTFIELDS, "merchant_id=$merchant_id&amount=$amount&callback_url=$callback_url" );
+	curl_setopt( $ch, CURLOPT_SSL_VERIFYPEER, false );
+	curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true );
+	$response = curl_exec( $ch );
+	curl_close( $ch );
+
+	$result = json_decode( $response );
+
+	if ( $result->status ) {
+		$url             = $result->payment_url;
+		$form['#action'] = $url;
+	} else {
+		$form['#action'] = $result->message;
+	}
+
+	$form['submit'] = array(
+		'#type'  => 'submit',
+		'#value' => t( 'Proceed with payment' )
+	);
+
+	return $form;
+}
+
+
+function commerce_Ir123pay_redirect_form_validate( $order, $payment_method ) {
+	$wrapper     = entity_metadata_wrapper( 'commerce_order', $order );
+	$merchant_id = $payment_method['settings']['merchant_d'];
+	$amount      = (int) $wrapper->commerce_order_total->amount->value();
+
+	if ( $_REQUEST['State'] == 'OK' ) {
+		$RefNum = $_REQUEST['RefNum'];
+
+		$ch = curl_init();
+		curl_setopt( $ch, CURLOPT_URL, 'https://123pay.ir/api/v1/verify/payment' );
+		curl_setopt( $ch, CURLOPT_POSTFIELDS, "merchant_id=$merchant_id&RefNum=$RefNum" );
+		curl_setopt( $ch, CURLOPT_SSL_VERIFYPEER, false );
+		curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true );
+		$response = curl_exec( $ch );
+		curl_close( $ch );
+
+		$result   = json_decode( $response );
+		$feedback = array(
+			'result'    => $result->status,
+			'remote_id' => $RefNum,
+			'authority' => $RefNum
+		);
+
+		if ( $result->status AND $amount == $result->amount ) {
+			watchdog( 'commerce_ir123pay', "123pay payment #" . $feedback['remote_id'] . " verification succeeded, 123pay returned " + $result->status, array(), WATCHDOG_INFO );
+			commerce_Ir123pay_process_transaction( $order, $payment_method, $feedback );
+
+			return true;
+		} else {
+			watchdog( 'commerce_ir123pay', "123pay payment #" . $feedback['remote_id'] . " verification failed, 123pay returned " + $result->status, array(), WATCHDOG_ERROR );
+
+			return false;
+		}
+
+	} else {
+		watchdog( 'commerce_ir123pay', 'No valid authority found', array(), WATCHDOG_ERROR );
+
+		return false;
+	}
+
+}
+
+
+function commerce_Ir123pay_process_transaction( $order, $payment_method, $feedback ) {
+	$transaction                = commerce_payment_transaction_new( 'Ir123pay', $order->order_id );
+	$payment_status             = commerce_Ir123pay_feedback_status( $feedback['result'] );
+	$transaction->instance_id   = $payment_method['instance_id'];
+	$transaction->remote_id     = $feedback['remote_id'];
+	$transaction->amount        = $order->commerce_order_total[ LANGUAGE_NONE ][0]['amount'];
+	$transaction->currency_code = $order->commerce_order_total[ LANGUAGE_NONE ][0]['currency_code'];
+	$transaction->remote_status = $feedback;
+	$transaction->status        = $payment_status['code'];
+	$transaction->message       = $payment_status['message'];
+	$transaction->payload       = $feedback['authority'];
+	commerce_payment_transaction_save( $transaction );
+
+	if ( $payment_status['code'] == COMMERCE_PAYMENT_STATUS_FAILURE ) {
+		commerce_payment_redirect_pane_previous_page( $order );
+	} else {
+		commerce_payment_redirect_pane_next_page( $order );
+	}
+
+}
+
+
+function commerce_Ir123pay_currencies() {
+	$options = array();
+	foreach ( commerce_currencies( true ) as $currency_code => $currency ) {
+		$options[ $currency_code ] = t( '@code - !name', array(
+			'@code'   => $currency['code'],
+			'@symbol' => $currency['symbol'],
+			'!name'   => $currency['name']
+		) );
+
+		if ( ! empty( $currency['symbol'] ) ) {
+			$options[ $currency_code ] .= ' - ' . check_plain( $currency['symbol'] );
+		}
+
+	}
+
+	return $options;
+}
+
+
+function commerce_Ir123pay_feedback_status( $status ) {
+	switch ( $status ) {
+		case true:
+			$st  = COMMERCE_PAYMENT_STATUS_SUCCESS;
+			$msg = t( 'Payment processed by merchant' );
+			break;
+		case false:
+			$st  = COMMERCE_PAYMENT_STATUS_FAILURE;
+			$msg = t( 'Incomplete data' );
+			break;
+	}
+
+	return array(
+		'code'    => $st,
+		'message' => $msg
+	);
+}
